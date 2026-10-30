@@ -45,7 +45,13 @@ jobs:
           curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
           case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
 
-      - run: make release
+      - name: Inject Vitrine/Pixie tweak into the Spotify IPA
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          python3 NativeDownloads/tools/build.py \
+            "$GITHUB_WORKSPACE/ipa/spotify.ipa" \
+            --theos "$THEOS" \
+            --output-dir "$GITHUB_WORKSPACE/out"
 
       - uses: actions/upload-artifact@v5
         if: inputs.upload_method != 'filebin'
@@ -59,7 +65,7 @@ jobs:
         run: |
           BIN="vitrine-${{ github.run_id }}"
           echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
-          for f in out/*.ipa; do
+          for f in "$GITHUB_WORKSPACE"/out/*.ipa; do
             curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
             echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
