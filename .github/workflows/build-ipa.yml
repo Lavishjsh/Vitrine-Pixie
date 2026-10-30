@@ -15,6 +15,8 @@ on:
 
 env:
   THEOS: ${{ github.workspace }}/theos
+  IPA_DIR: ${{ github.workspace }}/ipa
+  OUT_DIR: ${{ github.workspace }}/out
 
 jobs:
   build:
@@ -35,37 +37,65 @@ jobs:
           submodules: recursive
 
       - name: Install tools
+        shell: bash
         run: |
+          set -euxo pipefail
           brew install make dpkg ldid
           python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
       - name: Download IPA
+        shell: bash
         run: |
-          mkdir -p ipa
-          curl -fsSL "${{ inputs.ipa_url }}" -o ipa/spotify.ipa
-          case "$(file --mime-type -b ipa/spotify.ipa)" in application/zip|application/x-ios-app) ;; *) echo "::error::Not an IPA"; exit 1 ;; esac
+          set -euxo pipefail
+          mkdir -p "$IPA_DIR"
+          curl -fsSL "${{ inputs.ipa_url }}" -o "$IPA_DIR/spotify.ipa"
+          case "$(file --mime-type -b "$IPA_DIR/spotify.ipa")" in
+            application/zip|application/x-ios-app) ;;
+            *)
+              echo "::error::Downloaded file is not an IPA"
+              exit 1
+              ;;
+          esac
 
       - name: Inject Vitrine/Pixie tweak into the Spotify IPA
+        shell: bash
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/out"
+          set -euxo pipefail
+          rm -rf "$OUT_DIR"
           python3 NativeDownloads/tools/build.py \
-            "$GITHUB_WORKSPACE/ipa/spotify.ipa" \
+            "$IPA_DIR/spotify.ipa" \
             --theos "$THEOS" \
-            --output-dir "$GITHUB_WORKSPACE/out"
+            --output-dir "$OUT_DIR"
+
+      - name: Verify patched IPA output exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -l "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -type f -name "*.ipa" | head
 
       - uses: actions/upload-artifact@v5
         if: inputs.upload_method != 'filebin'
         with:
           name: vitrine.ipa
-          path: out/*.ipa
+          path: ${{ env.OUT_DIR }}/*.ipa
           if-no-files-found: error
 
       - name: Upload to filebin.net
         if: inputs.upload_method != 'artifacts'
+        shell: bash
         run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          files=("$OUT_DIR"/*.ipa)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No IPA files were produced"
+            exit 1
+          fi
+
           BIN="vitrine-${{ github.run_id }}"
           echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
-          for f in "$GITHUB_WORKSPACE"/out/*.ipa; do
+          for f in "${files[@]}"; do
             curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
             echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
           done
