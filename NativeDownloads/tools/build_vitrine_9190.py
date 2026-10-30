@@ -1,126 +1,116 @@
-"""Build the guarded SpotifyAudioProbe overlay for the supplied Vitrine 9.1.90 IPA."""
-import argparse
-import hashlib
-import json
-import plistlib
-import subprocess
-import tempfile
-from datetime import datetime
-from pathlib import Path
-from zipfile import ZipFile
+name: Build IPA from your own Spotify IPA
 
-from patch_imports import patch as patch_audio_imports
-from patch_native_restrictions import patch as patch_limits, guard_header, limits_header, layout
-from patch_key_request_mode import patch as patch_key_mode, key_header
-from patch_native_trace import patch as patch_native_trace,header as native_trace_header
-from fix_sideload_dependencies import pin_substrate_dependency, SUBSTRATE
-from signing_metadata import sign_preserving_entitlements
+on:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Direct link to a decrypted Spotify IPA"
+        required: true
+        type: string
+      upload_method:
+        description: "Where to put the result"
+        default: artifacts
+        type: choice
+        options: [artifacts, filebin, both]
 
-from pixie_target import PROFILE, ROOT, resolve_source, companion_sources, include_directories
-UUID = bytes.fromhex(PROFILE["uuid"])
-SOURCE_FILES = [str(path.relative_to(ROOT / "src")) for path in companion_sources()]
+env:
+  THEOS: ${{ github.workspace }}/theos
+  IPA_DIR: ${{ github.workspace }}/ipa
+  OUT_DIR: ${{ github.workspace }}/out
+  UPSTREAM_DIR: ${{ github.workspace }}/vitrine-upstream
 
-def run(*command):
-    subprocess.run([str(part) for part in command], check=True)
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("ipa", type=Path)
-    parser.add_argument("--vitrine-dylib", type=Path, help="Vitrine rebuilt from the local sources")
-    parser.add_argument("--fixed-key-mode-zero", action="store_true", help="Recovery rollback: use the direct mode-0 instruction from the last working build, without the runtime selector")
-    parser.add_argument("--output", type=Path, default=ROOT.parent / "outputs" /
-        datetime.now().strftime("build-%Y%m%d-%H%M%S-%f") / "Spotify-9.1.90-Vitrine-b16-Pixie-v1.3.ipa")
-    args = parser.parse_args()
-    source = args.ipa.resolve()
-    output = args.output.resolve()
-    if output.exists():
-        parser.error("Choose a new output folder; the output IPA already exists")
-    vitrine = args.vitrine_dylib.resolve() if args.vitrine_dylib else None
-    if vitrine:
-        run("codesign", "--verify", "--strict", vitrine)
-        run("xcrun", "dyld_info", "-validate_only", vitrine)
-        if b"showAlbumShuffle:play:download:add:playColor:" not in vitrine.read_bytes():
-            raise RuntimeError("The rebuilt Vitrine lacks the album action row")
-    if not source.is_file():
-        parser.error("Input IPA not found")
-    if resolve_source("NativeRestrictionsPatch.h").read_text() != guard_header():
-        raise RuntimeError("Native restriction header is out of sync")
-    if resolve_source("OfflineLimits.h").read_text() != limits_header():
-        raise RuntimeError("Offline limits header is out of sync")
-    if resolve_source("NativeKeyModePatch.h").read_text() != key_header():
-        raise RuntimeError("Native key-mode header is out of sync")
-    if resolve_source("NativeTracePatch.h").read_text() != native_trace_header():
-        raise RuntimeError("Native trace header is out of sync")
+      - uses: levibostian/action-hide-sensitive-inputs@v1
 
-    with ZipFile(source) as archive:
-        info_name = "Payload/Spotify.app/Info.plist"
-        info = plistlib.loads(archive.read(info_name))
-        version = info.get("CFBundleShortVersionString", "unknown")
-        print(f"Detected Spotify version: {version}")
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
 
-        executable = "Payload/Spotify.app/Spotify"
-        native = archive.read(executable)
+      - uses: actions/checkout@v5
+        with:
+          repository: theos/theos
+          path: theos
+          submodules: recursive
 
-        # TEMPORARY HACK: bypass the hardcoded version/UUID gate
-        # This allows other Spotify builds to get past validation, but compatibility
-        # is still not guaranteed.
-        if "Payload/Spotify.app/Frameworks/spotifyglass.dylib" not in archive.namelist():
-            raise RuntimeError("Expected Vitrine's spotifyglass.dylib")
-        if SUBSTRATE not in archive.namelist() or not archive.read(SUBSTRATE):
-            raise RuntimeError("Required embedded CydiaSubstrate executable is missing")
-        vitrine_bytes = vitrine.read_bytes() if vitrine else archive.read("Payload/Spotify.app/Frameworks/spotifyglass.dylib")
+      - name: Install tools
+        shell: bash
+        run: |
+          set -euxo pipefail
+          brew install make dpkg ldid
+          python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
-    patched, audio = patch_audio_imports(native)
-    patched, limits = patch_limits(patched)
-    patched, key = patch_key_mode(patched, runtime_selectable=False)
-    patched, native_trace = patch_native_trace(patched)
-    key['implementation']='verified static observation boundary restores fixed w2=0 before the original indirect call'
-    key['configuration_source']='verified_static_trace_argument'
-    output.parent.mkdir(parents=True, exist_ok=True)
-    sdk = subprocess.check_output(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"], text=True).strip()
-    with tempfile.TemporaryDirectory(prefix="vitrine-9190-") as temporary:
-        temporary = Path(temporary)
-        staged_vitrine = temporary / "spotifyglass.dylib"
-        staged_vitrine.write_bytes(vitrine_bytes)
-        substrate_dependency = pin_substrate_dependency(staged_vitrine)
-        run("codesign", "--force", "--sign", "-", "--timestamp=none", staged_vitrine)
-        run("codesign", "--verify", "--strict", staged_vitrine)
-        run("xcrun", "dyld_info", "-validate_only", staged_vitrine)
-        vitrine = staged_vitrine
-        companion = temporary / "SpotifyAudioProbe.dylib"
-        run("xcrun", "clang", "-dynamiclib", "-arch", "arm64", "-target", "arm64-apple-ios15.0",
-            "-isysroot", sdk, "-fobjc-arc", "-std=gnu11", "-O2", "-fvisibility=hidden",
-            "-Wall", "-Wextra", "-Wno-unused-parameter", "-Wno-nullability-completeness",
-            "-Werror=implicit-function-declaration", *("-I" + str(path) for path in include_directories()),
-            *companion_sources(),
-            "-framework", "AudioToolbox", "-framework", "Foundation", "-framework", "UIKit",
-            "-framework", "AVFAudio", "-framework", "CoreGraphics", "-framework", "AVFoundation",
-            "-framework", "CoreMedia", "-framework", "Network", "-framework", "ImageIO", "-framework", "QuartzCore", "-Wl,-install_name,@rpath/SpotifyAudioProbe.dylib", "-o", companion)
-        run("codesign", "--force", "--sign", "-", "--timestamp=none", companion)
-        binary = temporary / "Spotify"
-        binary.write_bytes(patched)
-        binary.chmod(0o755)
-        signing_metadata = sign_preserving_entitlements(binary, native, temporary / "Spotify.entitlements.plist")
-        run("xcrun", "dyld_info", "-validate_only", binary)
-        imports = subprocess.check_output(["xcrun", "dyld_info", "-imports", str(binary)], text=True)
-        for change in audio["changes"]:
-            matches = [line for line in imports.splitlines() if change["symbol"] in line]
-            if not matches or not all("SpotifyAudioProbe" in line for line in matches):
-                raise RuntimeError(f"Audio import not redirected: {change['symbol']}")
-        with ZipFile(source) as original, ZipFile(output, "w", allowZip64=True) as result:
-            for member in original.infolist():
-                replacement = binary.read_bytes() if member.filename == executable else vitrine.read_bytes() if vitrine and member.filename == "Payload/Spotify.app/Frameworks/spotifyglass.dylib" else original.read(member.filename)
-                result.writestr(member, replacement)
-            result.write(companion, "Payload/Spotify.app/Frameworks/SpotifyAudioProbe.dylib")
+      - name: Prepare upstream Vitrine source
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ ! -d "$UPSTREAM_DIR/.git" ]; then
+            git clone https://github.com/My-Name-Is-Jeff/vitrine.git "$UPSTREAM_DIR"
+          fi
 
-    with ZipFile(output) as check:
-        if check.testzip() is not None:
-            raise RuntimeError("IPA ZIP integrity check failed")
-    print(json.dumps({"output": str(output), "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
-                      "spotify_uuid": UUID.hex(), "audio_imports": audio,
-                      "native_limits": limits, "key_request_mode": key, "native_observation": native_trace,
-                      "signing_metadata": signing_metadata,
-                      "embedded_substrate_dependency": substrate_dependency}, indent=2))
+          git -C "$UPSTREAM_DIR" fetch --all --tags --prune
+          git -C "$UPSTREAM_DIR" checkout 36d3b38ec39c0b8b696f1d2db026ca9e9939bf14
+          git -C "$UPSTREAM_DIR" apply --check "$GITHUB_WORKSPACE/patches/vitrine-pixie.patch"
+          git -C "$UPSTREAM_DIR" apply "$GITHUB_WORKSPACE/patches/vitrine-pixie.patch"
 
-if __name__ == "__main__":
-    main()
+      - name: Download IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$IPA_DIR"
+          curl -fsSL "${{ inputs.ipa_url }}" -o "$IPA_DIR/spotify.ipa"
+          case "$(file --mime-type -b "$IPA_DIR/spotify.ipa")" in
+            application/zip|application/x-ios-app) ;;
+            *)
+              echo "::error::Downloaded file is not an IPA"
+              exit 1
+              ;;
+          esac
+
+      - name: Inject Vitrine/Pixie tweak into the Spotify IPA
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$OUT_DIR"
+          python3 NativeDownloads/tools/build.py \
+            "$IPA_DIR/spotify.ipa" \
+            --theos "$THEOS" \
+            --output-dir "$OUT_DIR"
+
+      - name: Verify patched IPA output exists
+        shell: bash
+        run: |
+          set -euxo pipefail
+          ls -l "$OUT_DIR"
+          find "$OUT_DIR" -maxdepth 1 -type f -name "*.ipa" | head
+
+      - uses: actions/upload-artifact@v5
+        if: inputs.upload_method != 'filebin'
+        with:
+          name: vitrine.ipa
+          path: ${{ env.OUT_DIR }}/*.ipa
+          if-no-files-found: error
+
+      - name: Upload to filebin.net
+        if: inputs.upload_method != 'artifacts'
+        shell: bash
+        run: |
+          set -euxo pipefail
+          shopt -s nullglob
+          files=("$OUT_DIR"/*.ipa)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "::error::No IPA files were produced"
+            exit 1
+          fi
+
+          BIN="vitrine-${{ github.run_id }}"
+          echo "### filebin.net download" >> "$GITHUB_STEP_SUMMARY"
+          for f in "${files[@]}"; do
+            curl -fsS -X POST -H "Content-Type: application/octet-stream" --data-binary "@$f" "https://filebin.net/$BIN/$(basename "$f")" >/dev/null
+            echo "- https://filebin.net/$BIN/$(basename "$f")" >> "$GITHUB_STEP_SUMMARY"
+          done
+          echo "- _filebin deletes bins after a few days of inactivity, download promptly._" >> "$GITHUB_STEP_SUMMARY"
