@@ -17,7 +17,7 @@ env:
   THEOS: ${{ github.workspace }}/theos
   IPA_DIR: ${{ github.workspace }}/ipa
   OUT_DIR: ${{ github.workspace }}/out
-  VITRINE_UPSTREAM: ${{ github.workspace }}/vitrine-upstream
+  UPSTREAM_DIR: ${{ github.workspace }}/vitrine-upstream
 
 jobs:
   build:
@@ -44,15 +44,18 @@ jobs:
           brew install make dpkg ldid
           python3 -m pip install --break-system-packages git+https://github.com/asdfzxcvbn/pyzule-rw.git
 
-      - name: Clone upstream Vitrine source
+      - name: Prepare upstream Vitrine source
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf "$VITRINE_UPSTREAM"
-          git clone https://github.com/My-Name-Is-Jeff/vitrine.git "$VITRINE_UPSTREAM"
-          git -C "$VITRINE_UPSTREAM" checkout 36d3b38ec39c0b8b696f1d2db026ca9e9939bf14
-          git -C "$VITRINE_UPSTREAM" apply --check "${{ github.workspace }}/patches/vitrine-pixie.patch"
-          git -C "$VITRINE_UPSTREAM" apply "${{ github.workspace }}/patches/vitrine-pixie.patch"
+          if [ ! -d "$UPSTREAM_DIR/.git" ]; then
+            git clone https://github.com/My-Name-Is-Jeff/vitrine.git "$UPSTREAM_DIR"
+          fi
+
+          git -C "$UPSTREAM_DIR" fetch --all --tags --prune
+          git -C "$UPSTREAM_DIR" checkout 36d3b38ec39c0b8b696f1d2db026ca9e9939bf14
+          git -C "$UPSTREAM_DIR" apply --check "$GITHUB_WORKSPACE/patches/vitrine-pixie.patch"
+          git -C "$UPSTREAM_DIR" apply "$GITHUB_WORKSPACE/patches/vitrine-pixie.patch"
 
       - name: Download IPA
         shell: bash
